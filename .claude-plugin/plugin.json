@@ -4,12 +4,8 @@
   "description": "Reliable automation, in-depth debugging, and performance analysis in Chrome using Chrome DevTools and Puppeteer",
   "mcpServers": {
     "chrome-devtools": {
-      "command": "npx",
-      "args": [
-        "chrome-devtools-mcp@1.9.0",
-        "--no-usage-statistics",
-        "--no-performance-crux"
-      ]
+      "type": "http",
+      "url": "http://127.0.0.1:8934/mcp"
     }
   }
 }
