@@ -32,10 +32,7 @@ if (process.env['CHROME_DEVTOOLS_MCP_CRASH_ON_UNCAUGHT'] !== 'true') {
   });
 }
 
-logger?.(`Starting Chrome DevTools MCP Server v${VERSION}`);
-const server = await McpServer.from(args, {
-  logFile,
-});
+let server: McpServer | undefined = undefined;
 
 // Shutdown on stdin EOF (stdio MCP convention — the client closes the
 // transport to signal exit) and on standard termination signals. Without
@@ -56,7 +53,7 @@ async function shutdown(reason: string): Promise<void> {
     logger?.('Shutdown timeout exceeded, forcing exit');
     process.exit(0);
   }, 5000).unref();
-  await server.close();
+  await server?.close();
   process.exit(0);
 }
 process.stdin.on('end', () => {
@@ -73,6 +70,12 @@ process.on('SIGINT', () => {
 });
 process.on('SIGHUP', () => {
   void shutdown('SIGHUP');
+});
+
+logger?.(`Starting Chrome DevTools MCP Server v${VERSION}`);
+
+server = await McpServer.from(args, {
+  logFile,
 });
 
 const transport = new StdioServerTransport();

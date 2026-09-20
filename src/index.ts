@@ -50,6 +50,9 @@ export interface McpServerOptions {
 export class McpServer {
   readonly server: SdkMcpServer;
   #serverArgs: ParsedArguments;
+  #devtools: boolean;
+  #blocklist?: string[];
+  #allowlist?: string[];
   #browserManager: BrowserManager;
   #context?: McpContext;
 
@@ -66,7 +69,19 @@ export class McpServer {
     options: McpServerOptions = {},
   ) {
     this.#serverArgs = serverArgs;
-    this.#browserManager = new BrowserManager(serverArgs, options);
+    this.#devtools = serverArgs.experimentalDevtools ?? false;
+    this.#blocklist = serverArgs.blockedUrlPattern
+      ? serverArgs.blockedUrlPattern.map(String)
+      : undefined;
+    this.#allowlist = serverArgs.allowedUrlPattern
+      ? serverArgs.allowedUrlPattern.map(String)
+      : undefined;
+    this.#browserManager = new BrowserManager(serverArgs, {
+      ...options,
+      devtools: this.#devtools,
+      blocklist: this.#blocklist,
+      allowlist: this.#allowlist,
+    });
 
     if (this.#serverArgs.usageStatistics) {
       ClearcutLogger.initialize({
@@ -130,11 +145,10 @@ export class McpServer {
   async close(): Promise<void> {
     this.#context?.dispose();
     this.#context = undefined;
-    try {
-      await this.server.close();
-    } finally {
-      await this.#browserManager.close();
-    }
+    await Promise.allSettled([
+      this.#browserManager.close(),
+      this.server.close(),
+    ]);
   }
 
   [Symbol.dispose](): void {
@@ -209,22 +223,14 @@ export class McpServer {
 
     if (this.#context?.browser !== browser) {
       this.#context?.dispose();
-      const devtools = this.#serverArgs.experimentalDevtools ?? false;
-      const blocklist = this.#serverArgs.blockedUrlPattern
-        ? this.#serverArgs.blockedUrlPattern.map(String)
-        : undefined;
-      const allowlist = this.#serverArgs.allowedUrlPattern
-        ? this.#serverArgs.allowedUrlPattern.map(String)
-        : undefined;
-
       this.#context = await McpContext.from(browser, logger, {
-        experimentalDevToolsDebugging: devtools,
+        experimentalDevToolsDebugging: this.#devtools,
         experimentalIncludeAllPages:
           this.#serverArgs.experimentalIncludeAllPages,
         performanceCrux: this.#serverArgs.performanceCrux,
         sourceMaps: this.#serverArgs.sourceMaps,
-        allowList: allowlist,
-        blocklist: blocklist,
+        allowList: this.#allowlist,
+        blocklist: this.#blocklist,
         allowUnrestrictedPaths: this.#serverArgs.allowUnrestrictedPaths,
         // Surfaces a one-time note in the next response after a reconnect.
         reconnected: this.#context !== undefined,

@@ -157,6 +157,26 @@ describe('browser', () => {
       assert.strictEqual(second, pptrBrowser2);
       sinon.assert.calledTwice(launchStub);
     });
+
+    it('waits for in-flight launch and closes browser when close() is called mid-launch', async () => {
+      const pptrBrowser = createMockPuppeteerBrowser();
+      const {promise, resolve} = Promise.withResolvers<Browser>();
+      sinon.stub(puppeteer, 'launch').returns(promise);
+
+      const args = createMockParsedArguments({
+        headless: true,
+        isolated: true,
+      });
+      const manager = new BrowserManager(args);
+
+      const ensurePromise = manager.ensureBrowser();
+      const closePromise = manager.close();
+
+      resolve(pptrBrowser);
+      await Promise.all([ensurePromise, closePromise]);
+
+      sinon.assert.calledOnceWithExactly(pptrBrowser.close);
+    });
   });
 
   describe('rootSandboxLaunchError', () => {
@@ -311,11 +331,14 @@ describe('browser', () => {
         chromeArgs: ['--remote-debugging-port=0'],
       });
       try {
-        const manager = new BrowserManager(createMockParsedArguments());
-        const connectedBrowser = await manager.ensureBrowserConnected({
-          userDataDir: folderPath,
-          devtools: false,
-        });
+        const manager = new BrowserManager(
+          createMockParsedArguments({
+            userDataDir: folderPath,
+            autoConnect: true,
+            experimentalDevtools: false,
+          }),
+        );
+        const connectedBrowser = await manager.ensureBrowser();
         assert.ok(connectedBrowser);
         assert.ok(connectedBrowser.connected);
         await manager.close();

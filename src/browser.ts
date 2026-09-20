@@ -25,7 +25,6 @@ export interface McpConnectOptions {
   browserURL?: string;
   wsEndpoint?: string;
   wsHeaders?: Record<string, string>;
-  devtools: boolean;
   channel?: Channel;
   userDataDir?: string;
   enableExtensions?: boolean;
@@ -56,13 +55,20 @@ export interface McpLaunchOptions {
 
 export interface BrowserManagerOptions {
   logFile?: fs.WriteStream;
+  devtools?: boolean;
+  blocklist?: string[];
+  allowlist?: string[];
 }
 
 export class BrowserManager {
   #browser?: Browser;
   #browserMode?: 'launched' | 'connected';
+  #pendingBrowser?: Promise<Browser>;
   #serverArgs: ParsedArguments;
   #options: BrowserManagerOptions;
+  #devtools: boolean;
+  #blocklist?: string[];
+  #allowlist?: string[];
 
   constructor(
     serverArgs: ParsedArguments,
@@ -70,6 +76,18 @@ export class BrowserManager {
   ) {
     this.#serverArgs = serverArgs;
     this.#options = options;
+    this.#devtools =
+      options.devtools ?? serverArgs.experimentalDevtools ?? false;
+    this.#blocklist =
+      options.blocklist ??
+      (serverArgs.blockedUrlPattern
+        ? serverArgs.blockedUrlPattern.map(String)
+        : undefined);
+    this.#allowlist =
+      options.allowlist ??
+      (serverArgs.allowedUrlPattern
+        ? serverArgs.allowedUrlPattern.map(String)
+        : undefined);
   }
 
   static makeTargetFilter(enableExtensions = false) {
@@ -237,70 +255,8 @@ export class BrowserManager {
     }
   }
 
-  async ensureBrowser(): Promise<Browser> {
-    if (this.#browser?.connected) {
-      return this.#browser;
-    }
-
-    const chromeArgs: string[] = (this.#serverArgs.chromeArg ?? []).map(String);
-    const ignoreDefaultChromeArgs: string[] = (
-      this.#serverArgs.ignoreDefaultChromeArg ?? []
-    ).map(String);
-    if (this.#serverArgs.proxyServer) {
-      chromeArgs.push(`--proxy-server=${this.#serverArgs.proxyServer}`);
-    }
-    const devtools = this.#serverArgs.experimentalDevtools ?? false;
-    const blocklist = this.#serverArgs.blockedUrlPattern
-      ? this.#serverArgs.blockedUrlPattern.map(String)
-      : undefined;
-    const allowlist = this.#serverArgs.allowedUrlPattern
-      ? this.#serverArgs.allowedUrlPattern.map(String)
-      : undefined;
-
-    const channel = this.#serverArgs.channel;
-
-    if (
-      this.#serverArgs.browserUrl ||
-      this.#serverArgs.wsEndpoint ||
-      this.#serverArgs.autoConnect
-    ) {
-      return await this.ensureBrowserConnected({
-        browserURL: this.#serverArgs.browserUrl,
-        wsEndpoint: this.#serverArgs.wsEndpoint,
-        wsHeaders: this.#serverArgs.wsHeaders,
-        // Important: only pass channel, if autoConnect is true.
-        channel: this.#serverArgs.autoConnect ? channel : undefined,
-        userDataDir: this.#serverArgs.userDataDir,
-        devtools,
-        blocklist,
-        allowlist,
-      });
-    }
-
-    return await this.ensureBrowserLaunched({
-      headless: this.#serverArgs.headless,
-      executablePath: this.#serverArgs.executablePath,
-      channel,
-      isolated: this.#serverArgs.isolated ?? false,
-      userDataDir: this.#serverArgs.userDataDir,
-      logFile: this.#options.logFile,
-      viewport: this.#serverArgs.viewport,
-      chromeArgs,
-      ignoreDefaultChromeArgs,
-      acceptInsecureCerts: this.#serverArgs.acceptInsecureCerts,
-      devtools,
-      enableExtensions: this.#serverArgs.categoryExtensions,
-      viaCli: this.#serverArgs.viaCli,
-      blocklist,
-      allowlist,
-    });
-  }
-
-  async ensureBrowserConnected(options: McpConnectOptions): Promise<Browser> {
+  static async connect(options: McpConnectOptions): Promise<Browser> {
     const {channel, enableExtensions} = options;
-    if (this.#browser?.connected) {
-      return this.#browser;
-    }
 
     const connectOptions: Parameters<typeof puppeteer.connect>[0] = {
       targetFilter: BrowserManager.makeTargetFilter(enableExtensions),
@@ -369,12 +325,9 @@ export class BrowserManager {
 
     logger?.('Connecting Puppeteer to ', JSON.stringify(connectOptions));
     try {
-      // Assign mode before browser so a concurrent close() never sees
-      // `browser` set with `browserMode` still undefined (would fall through
-      // to the disconnect() path and orphan a launched Chrome).
       const connected = await puppeteer.connect(connectOptions);
-      this.#browserMode = 'connected';
-      this.#browser = connected;
+      logger?.('Connected Puppeteer');
+      return connected;
     } catch (err) {
       throw new Error(
         `Could not connect to Chrome. ${autoConnect ? `Check if Chrome is running and remote debugging is enabled by going to chrome://inspect/#remote-debugging.` : `Check if Chrome is running.`}`,
@@ -383,16 +336,86 @@ export class BrowserManager {
         },
       );
     }
-    logger?.('Connected Puppeteer');
-    return this.#browser;
   }
 
-  async ensureBrowserLaunched(options: McpLaunchOptions): Promise<Browser> {
+  async ensureBrowser(): Promise<Browser> {
     if (this.#browser?.connected) {
       return this.#browser;
     }
+    if (this.#pendingBrowser) {
+      return await this.#pendingBrowser;
+    }
+
+    const pending = this.#initBrowser();
+    this.#pendingBrowser = pending;
+    try {
+      return await pending;
+    } finally {
+      if (this.#pendingBrowser === pending) {
+        this.#pendingBrowser = undefined;
+      }
+    }
+  }
+
+  async #initBrowser(): Promise<Browser> {
+    if (
+      this.#serverArgs.browserUrl ||
+      this.#serverArgs.wsEndpoint ||
+      this.#serverArgs.autoConnect
+    ) {
+      return await this.#ensureBrowserConnected();
+    }
+    return await this.#ensureBrowserLaunched();
+  }
+
+  async #ensureBrowserConnected(): Promise<Browser> {
+    // Assign mode before browser so a concurrent close() never sees
+    // `browser` set with `browserMode` still undefined (would fall through
+    // to the disconnect() path and orphan a launched Chrome).
+    const connected = await BrowserManager.connect({
+      browserURL: this.#serverArgs.browserUrl,
+      wsEndpoint: this.#serverArgs.wsEndpoint,
+      wsHeaders: this.#serverArgs.wsHeaders,
+      // Important: only pass channel, if autoConnect is true.
+      channel: this.#serverArgs.autoConnect
+        ? this.#serverArgs.channel
+        : undefined,
+      userDataDir: this.#serverArgs.userDataDir,
+      enableExtensions: this.#serverArgs.categoryExtensions,
+      blocklist: this.#blocklist,
+      allowlist: this.#allowlist,
+    });
+    this.#browserMode = 'connected';
+    this.#browser = connected;
+    return this.#browser;
+  }
+
+  async #ensureBrowserLaunched(): Promise<Browser> {
+    const chromeArgs: string[] = (this.#serverArgs.chromeArg ?? []).map(String);
+    const ignoreDefaultChromeArgs: string[] = (
+      this.#serverArgs.ignoreDefaultChromeArg ?? []
+    ).map(String);
+    if (this.#serverArgs.proxyServer) {
+      chromeArgs.push(`--proxy-server=${this.#serverArgs.proxyServer}`);
+    }
     // Assign mode before browser; see the connect path above for rationale.
-    const launched = await BrowserManager.launch(options);
+    const launched = await BrowserManager.launch({
+      headless: this.#serverArgs.headless,
+      executablePath: this.#serverArgs.executablePath,
+      channel: this.#serverArgs.channel,
+      isolated: this.#serverArgs.isolated ?? false,
+      userDataDir: this.#serverArgs.userDataDir,
+      logFile: this.#options.logFile,
+      viewport: this.#serverArgs.viewport,
+      chromeArgs,
+      ignoreDefaultChromeArgs,
+      acceptInsecureCerts: this.#serverArgs.acceptInsecureCerts,
+      devtools: this.#devtools,
+      enableExtensions: this.#serverArgs.categoryExtensions,
+      viaCli: this.#serverArgs.viaCli,
+      blocklist: this.#blocklist,
+      allowlist: this.#allowlist,
+    });
     this.#browserMode = 'launched';
     this.#browser = launched;
     return this.#browser;
@@ -405,6 +428,13 @@ export class BrowserManager {
    * the connection has already been dropped.
    */
   async close(): Promise<void> {
+    const pending = this.#pendingBrowser;
+    this.#pendingBrowser = undefined;
+    if (pending) {
+      await pending.catch(() => {
+        // Ignore in-flight launch/connect errors during shutdown.
+      });
+    }
     const browser = this.#browser;
     const mode = this.#browserMode;
     this.#browser = undefined;
