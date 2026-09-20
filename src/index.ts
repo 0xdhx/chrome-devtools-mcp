@@ -8,8 +8,7 @@ import type fs from 'node:fs';
 import path from 'node:path';
 import {pathToFileURL} from 'node:url';
 
-import type {Channel} from './browser.js';
-import {ensureBrowserConnected, ensureBrowserLaunched} from './browser.js';
+import {BrowserManager} from './browser.js';
 import {type ParsedArguments} from './config/mcp-options.js';
 import {loadIssueDescriptions} from './devtools/issueDescriptions.js';
 import {McpContext} from './McpContext.js';
@@ -51,7 +50,7 @@ export interface McpServerOptions {
 export class McpServer {
   readonly server: SdkMcpServer;
   #serverArgs: ParsedArguments;
-  #options: McpServerOptions;
+  #browserManager: BrowserManager;
   #context?: McpContext;
 
   /**
@@ -67,7 +66,7 @@ export class McpServer {
     options: McpServerOptions = {},
   ) {
     this.#serverArgs = serverArgs;
-    this.#options = options;
+    this.#browserManager = new BrowserManager(serverArgs, options);
 
     if (this.#serverArgs.usageStatistics) {
       ClearcutLogger.initialize({
@@ -131,7 +130,11 @@ export class McpServer {
   async close(): Promise<void> {
     this.#context?.dispose();
     this.#context = undefined;
-    await this.server.close();
+    try {
+      await this.server.close();
+    } finally {
+      await this.#browserManager.close();
+    }
   }
 
   [Symbol.dispose](): void {
@@ -202,58 +205,18 @@ export class McpServer {
   }
 
   async #getContext(): Promise<McpContext> {
-    const chromeArgs: string[] = (this.#serverArgs.chromeArg ?? []).map(String);
-    const ignoreDefaultChromeArgs: string[] = (
-      this.#serverArgs.ignoreDefaultChromeArg ?? []
-    ).map(String);
-    if (this.#serverArgs.proxyServer) {
-      chromeArgs.push(`--proxy-server=${this.#serverArgs.proxyServer}`);
-    }
-    const devtools = this.#serverArgs.experimentalDevtools ?? false;
-    const blocklist = this.#serverArgs.blockedUrlPattern
-      ? this.#serverArgs.blockedUrlPattern.map(String)
-      : undefined;
-    const allowlist = this.#serverArgs.allowedUrlPattern
-      ? this.#serverArgs.allowedUrlPattern.map(String)
-      : undefined;
-
-    const channel = this.#serverArgs.channel as Channel | undefined;
-
-    const browser =
-      this.#serverArgs.browserUrl ||
-      this.#serverArgs.wsEndpoint ||
-      this.#serverArgs.autoConnect
-        ? await ensureBrowserConnected({
-            browserURL: this.#serverArgs.browserUrl,
-            wsEndpoint: this.#serverArgs.wsEndpoint,
-            wsHeaders: this.#serverArgs.wsHeaders,
-            // Important: only pass channel, if autoConnect is true.
-            channel: this.#serverArgs.autoConnect ? channel : undefined,
-            userDataDir: this.#serverArgs.userDataDir,
-            devtools,
-            blocklist,
-            allowlist,
-          })
-        : await ensureBrowserLaunched({
-            headless: this.#serverArgs.headless,
-            executablePath: this.#serverArgs.executablePath,
-            channel,
-            isolated: this.#serverArgs.isolated ?? false,
-            userDataDir: this.#serverArgs.userDataDir,
-            logFile: this.#options.logFile,
-            viewport: this.#serverArgs.viewport,
-            chromeArgs,
-            ignoreDefaultChromeArgs,
-            acceptInsecureCerts: this.#serverArgs.acceptInsecureCerts,
-            devtools,
-            enableExtensions: this.#serverArgs.categoryExtensions,
-            viaCli: this.#serverArgs.viaCli,
-            blocklist,
-            allowlist,
-          });
+    const browser = await this.#browserManager.ensureBrowser();
 
     if (this.#context?.browser !== browser) {
       this.#context?.dispose();
+      const devtools = this.#serverArgs.experimentalDevtools ?? false;
+      const blocklist = this.#serverArgs.blockedUrlPattern
+        ? this.#serverArgs.blockedUrlPattern.map(String)
+        : undefined;
+      const allowlist = this.#serverArgs.allowedUrlPattern
+        ? this.#serverArgs.allowedUrlPattern.map(String)
+        : undefined;
+
       this.#context = await McpContext.from(browser, logger, {
         experimentalDevToolsDebugging: devtools,
         experimentalIncludeAllPages:

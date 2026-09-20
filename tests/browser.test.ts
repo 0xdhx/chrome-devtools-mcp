@@ -7,19 +7,18 @@
 import assert from 'node:assert';
 import os from 'node:os';
 import path from 'node:path';
-import {describe, it} from 'node:test';
+import {afterEach, describe, it} from 'node:test';
 
 import {executablePath} from 'puppeteer';
+import sinon from 'sinon';
+
+import {BrowserManager} from '../src/browser.js';
+import {puppeteer, type Browser} from '../src/third_party/index.js';
 
 import {
-  detectDisplay,
-  ensureBrowserConnected,
-  launch,
-  makeTargetFilter,
-  rootSandboxLaunchError,
-} from '../src/browser.js';
-import type {Browser} from '../src/third_party/index.js';
-
+  createMockParsedArguments,
+  createMockPuppeteerBrowser,
+} from './mocks.js';
 import {serverHooks} from './server.js';
 
 async function safeClose(browser: Browser) {
@@ -58,8 +57,106 @@ async function runWithRetry(fn: () => Promise<void>) {
 }
 
 describe('browser', () => {
+  afterEach(() => {
+    sinon.restore();
+  });
+
   it('detects display does not crash', () => {
-    detectDisplay();
+    BrowserManager.detectDisplay();
+  });
+
+  describe('BrowserManager', () => {
+    it('launches a browser when no connect options are set and closes it on close()', async () => {
+      const pptrBrowser = createMockPuppeteerBrowser();
+      const launchStub = sinon.stub(puppeteer, 'launch').resolves(pptrBrowser);
+      const connectStub = sinon.stub(puppeteer, 'connect');
+
+      const args = createMockParsedArguments({
+        headless: true,
+        isolated: true,
+        channel: 'canary',
+        proxyServer: 'http://localhost:8080',
+        chromeArg: ['--custom-arg'],
+      });
+      const manager = new BrowserManager(args);
+
+      const browser1 = await manager.ensureBrowser();
+      const browser2 = await manager.ensureBrowser();
+
+      assert.strictEqual(browser1, pptrBrowser);
+      assert.strictEqual(browser2, pptrBrowser);
+      sinon.assert.calledOnce(launchStub);
+      sinon.assert.notCalled(connectStub);
+      sinon.assert.calledWithMatch(launchStub, {
+        channel: 'chrome-canary',
+        headless: true,
+        args: [
+          '--custom-arg',
+          '--proxy-server=http://localhost:8080',
+          '--hide-crash-restore-bubble',
+          '--screen-info={3840x2160}',
+        ],
+      });
+
+      await manager.close();
+      sinon.assert.calledOnceWithExactly(pptrBrowser.close);
+      sinon.assert.notCalled(pptrBrowser.disconnect);
+    });
+
+    it('connects to a browser when browserUrl is set and disconnects on close()', async () => {
+      const pptrBrowser = createMockPuppeteerBrowser();
+      const launchStub = sinon.stub(puppeteer, 'launch');
+      const connectStub = sinon
+        .stub(puppeteer, 'connect')
+        .resolves(pptrBrowser);
+
+      const args = createMockParsedArguments({
+        browserUrl: 'http://127.0.0.1:9222',
+        channel: 'stable',
+      });
+      const manager = new BrowserManager(args);
+
+      const browser = await manager.ensureBrowser();
+
+      assert.strictEqual(browser, pptrBrowser);
+      sinon.assert.calledOnce(connectStub);
+      sinon.assert.notCalled(launchStub);
+      sinon.assert.calledWithMatch(connectStub, {
+        browserURL: 'http://127.0.0.1:9222',
+      });
+
+      await manager.close();
+      sinon.assert.calledOnceWithExactly(pptrBrowser.disconnect);
+      sinon.assert.notCalled(pptrBrowser.close);
+    });
+
+    it('reconnects when existing browser is no longer connected', async () => {
+      const pptrBrowser1 = createMockPuppeteerBrowser();
+      const pptrBrowser2 = createMockPuppeteerBrowser();
+      let isConnected = true;
+      sinon.stub(pptrBrowser1, 'connected').get(() => isConnected);
+
+      const launchStub = sinon
+        .stub(puppeteer, 'launch')
+        .onFirstCall()
+        .resolves(pptrBrowser1)
+        .onSecondCall()
+        .resolves(pptrBrowser2);
+
+      const args = createMockParsedArguments({
+        headless: true,
+        isolated: true,
+      });
+      const manager = new BrowserManager(args);
+
+      const first = await manager.ensureBrowser();
+      assert.strictEqual(first, pptrBrowser1);
+
+      isConnected = false;
+      const second = await manager.ensureBrowser();
+      assert.strictEqual(second, pptrBrowser2);
+      sinon.assert.calledTwice(launchStub);
+    });
   });
 
   describe('rootSandboxLaunchError', () => {
@@ -68,7 +165,7 @@ describe('browser', () => {
     );
 
     it('explains an opaque launch failure when running as root', () => {
-      const error = rootSandboxLaunchError(targetClosed, [], 0);
+      const error = BrowserManager.rootSandboxLaunchError(targetClosed, [], 0);
       assert.ok(error);
       assert.match(error.message, /non-root user/);
       assert.match(error.message, /pptr\.dev\/troubleshooting/);
@@ -79,35 +176,51 @@ describe('browser', () => {
 
     it('does not explain failures when not running as root', () => {
       assert.strictEqual(
-        rootSandboxLaunchError(targetClosed, [], 1000),
+        BrowserManager.rootSandboxLaunchError(targetClosed, [], 1000),
         undefined,
       );
     });
 
     it('does not explain failures on platforms without uids', () => {
       assert.strictEqual(
-        rootSandboxLaunchError(targetClosed, [], undefined),
+        BrowserManager.rootSandboxLaunchError(targetClosed, [], undefined),
         undefined,
       );
     });
 
     it('does not explain failures when the sandbox is already disabled', () => {
       assert.strictEqual(
-        rootSandboxLaunchError(targetClosed, ['--no-sandbox'], 0),
+        BrowserManager.rootSandboxLaunchError(
+          targetClosed,
+          ['--no-sandbox'],
+          0,
+        ),
         undefined,
       );
       assert.strictEqual(
-        rootSandboxLaunchError(targetClosed, ['--no-sandbox=true'], 0),
+        BrowserManager.rootSandboxLaunchError(
+          targetClosed,
+          ['--no-sandbox=true'],
+          0,
+        ),
         undefined,
       );
     });
 
     it('is not fooled by unrelated arguments that start the same', () => {
       assert.ok(
-        rootSandboxLaunchError(targetClosed, ['--no-sandbox-and-elevated'], 0),
+        BrowserManager.rootSandboxLaunchError(
+          targetClosed,
+          ['--no-sandbox-and-elevated'],
+          0,
+        ),
       );
       assert.ok(
-        rootSandboxLaunchError(targetClosed, ['--disable-setuid-sandbox'], 0),
+        BrowserManager.rootSandboxLaunchError(
+          targetClosed,
+          ['--disable-setuid-sandbox'],
+          0,
+        ),
       );
     });
   });
@@ -119,7 +232,7 @@ describe('browser', () => {
         tmpDir,
         `temp-folder-${crypto.randomUUID()}`,
       );
-      const browser1 = await launch({
+      const browser1 = await BrowserManager.launch({
         headless: true,
         isolated: false,
         userDataDir: folderPath,
@@ -128,7 +241,7 @@ describe('browser', () => {
       });
       try {
         try {
-          const browser2 = await launch({
+          const browser2 = await BrowserManager.launch({
             headless: true,
             isolated: false,
             userDataDir: folderPath,
@@ -156,7 +269,7 @@ describe('browser', () => {
         tmpDir,
         `temp-folder-${crypto.randomUUID()}`,
       );
-      const browser = await launch({
+      const browser = await BrowserManager.launch({
         headless: true,
         isolated: false,
         userDataDir: folderPath,
@@ -189,7 +302,7 @@ describe('browser', () => {
         tmpDir,
         `temp-folder-${crypto.randomUUID()}`,
       );
-      const browser = await launch({
+      const browser = await BrowserManager.launch({
         headless: true,
         isolated: false,
         userDataDir: folderPath,
@@ -198,13 +311,14 @@ describe('browser', () => {
         chromeArgs: ['--remote-debugging-port=0'],
       });
       try {
-        const connectedBrowser = await ensureBrowserConnected({
+        const manager = new BrowserManager(createMockParsedArguments());
+        const connectedBrowser = await manager.ensureBrowserConnected({
           userDataDir: folderPath,
           devtools: false,
         });
         assert.ok(connectedBrowser);
         assert.ok(connectedBrowser.connected);
-        connectedBrowser.disconnect();
+        await manager.close();
       } finally {
         await safeClose(browser);
       }
@@ -225,7 +339,7 @@ describe('browser', () => {
           '<html><body>Blocked</body></html>',
         );
 
-        const browser = await launch({
+        const browser = await BrowserManager.launch({
           headless: true,
           isolated: true,
           executablePath: await executablePath(),
@@ -268,7 +382,7 @@ describe('browser', () => {
           '<html><body>Blocked</body></html>',
         );
 
-        const browser = await launch({
+        const browser = await BrowserManager.launch({
           headless: true,
           isolated: true,
           executablePath: await executablePath(),
@@ -303,8 +417,8 @@ describe('browser', () => {
 
   describe('makeTargetFilter', () => {
     it('filters internal chrome and extension targets', () => {
-      const filterWithoutExtensions = makeTargetFilter(false);
-      const filterWithExtensions = makeTargetFilter(true);
+      const filterWithoutExtensions = BrowserManager.makeTargetFilter(false);
+      const filterWithExtensions = BrowserManager.makeTargetFilter(true);
 
       const mockTarget = (url: string) => ({
         url: () => url,
